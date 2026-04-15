@@ -1,378 +1,222 @@
-import sys
-import queue
+import customtkinter as ctk
+from logic import HidController
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from collections import deque
+from tkinter import messagebox
 from datetime import datetime
-import hid
-import pyqtgraph as pg
-from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout,
-    QHBoxLayout, QComboBox, QPushButton, QLineEdit,
-    QLabel, QFrame, QSizePolicy
-)
-from PyQt6.QtCore import QThread, pyqtSignal, Qt
-from PyQt6.QtGui import QFont
-
-# ---------------------------------------------------------
-# Ваш оригінальний HIDReaderThread залишається без змін
-# ---------------------------------------------------------
-class HIDReaderThread(QThread):
-    """
-    Ізольований робочий потік для неблокуючого зчитування даних.
-    """
-    data_received = pyqtSignal(str)
-    sample_received = pyqtSignal(object)
-    error_occurred = pyqtSignal(str)
-
-    def __init__(self, device_path: bytes):
-        super().__init__()
-        self.device_path = device_path
-        self.is_running = True
-        self.active_device = None
-        self._rx_buffer = bytearray()
-        self._tx_queue = queue.Queue()
-
-    @staticmethod
-    def _try_parse_sample(decoded_line: str):
-        if not decoded_line.startswith("@"):
-            return None
-        parts = decoded_line.split(",")
-        if len(parts) != 5:
-            return None
-        if parts[0] not in ("@S", "@T"):
-            return None
-        try:
-            sample = {
-                "tag": parts[0][1],
-                "seq": int(parts[1]),
-                "tick_ms": int(parts[2]),
-                "freq_hz": int(parts[3]),
-                "gate_index": int(parts[4]),
-            }
-        except ValueError:
-            return None
-
-        gate_map = {0: "0.1s", 1: "1s", 2: "10s"}
-        sample["gate_label"] = gate_map.get(sample["gate_index"], str(sample["gate_index"]))
-        return sample
-
-    def run(self):
-        try:
-            self.active_device = hid.device()
-            self.active_device.open_path(self.device_path)
-            self.active_device.set_nonblocking(1)
-
-            while self.is_running:
-                self._flush_pending_commands()
-                data_payload = self.active_device.read(64)
-
-                if data_payload:
-                    raw_bytes = bytes(data_payload)
-                    trimmed_bytes = raw_bytes.rstrip(b"\x00")
-                    if not trimmed_bytes:
-                        continue
-
-                    self._rx_buffer.extend(trimmed_bytes)
-                    self._rx_buffer = self._rx_buffer.replace(b"\r", b"\n")
-
-                    while True:
-                        newline_index = self._rx_buffer.find(b"\n")
-                        if newline_index < 0:
-                            if len(self._rx_buffer) > 512:
-                                self._rx_buffer.clear()
-                            break
-
-                        line_bytes = bytes(self._rx_buffer[:newline_index]).strip()
-                        del self._rx_buffer[: newline_index + 1]
-
-                        if not line_bytes:
-                            continue
-
-                        decoded_text = line_bytes.decode("utf-8", errors="replace")
-                        timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-                        formatted_output = f"[{timestamp}] {decoded_text}"
-                        
-                        self.data_received.emit(formatted_output)
-
-                        sample = self._try_parse_sample(decoded_text)
-                        if sample is not None:
-                            self.sample_received.emit(sample)
-                else:
-                    self.msleep(10)
-
-        except Exception as e:
-            self.error_occurred.emit(f"Hardware Exception: {str(e)}")
-        finally:
-            if self.active_device:
-                try:
-                    self.active_device.close()
-                except Exception:
-                    pass
-
-    def enqueue_command(self, command: str):
-        if command is None: return
-        cmd = command.strip()
-        if not cmd: return
-        self._tx_queue.put(cmd)
-
-    def _flush_pending_commands(self):
-        if self.active_device is None: return
-        for _ in range(4):
-            try:
-                cmd = self._tx_queue.get_nowait()
-            except queue.Empty:
-                break
-            self._write_command(cmd)
-
-    def _write_command(self, command: str):
-        payload = (command + "\r\n").encode("ascii", errors="ignore")[:64]
-        report_with_id = bytearray(65)
-        report_with_id[0] = 0
-        report_with_id[1 : 1 + len(payload)] = payload
-        try:
-            self.active_device.write(report_with_id)
-            return
-        except Exception:
-            pass
-        report_no_id = bytearray(64)
-        report_no_id[: len(payload)] = payload
-        self.active_device.write(report_no_id)
-
-    def stop_reading(self):
-        self.is_running = False
-        self.wait()
+ctk.set_appearance_mode("dark")
+ctk.set_default_color_theme("blue")
 
 
-# ---------------------------------------------------------
-# Новий графічний інтерфейс на основі макета
-# ---------------------------------------------------------
-class ModernHackathonGUI(QMainWindow):
+class HidApp(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("SiTime Frequency Monitor")
-        self.resize(1000, 700)
-        self.setStyleSheet("background-color: #F8F9FA;") # Світлий фон як на макеті
+        self.title("Frequency Counter Pro")
+        self.geometry("1280x640")
 
-        self.device_mapping = {}
-        self.reader_thread = None
-        
-        # Дані для графіка
-        self.plot_time = []
-        self.plot_freq = []
-        self.time_counter = 0
+        # Initialize Logic
+        self.logic = HidController()
 
-        self._construct_ui()
-        self._enumerate_hid_devices()
+        # Data storage
+        self.max_points = 100
+        self.y_data = deque([0] * self.max_points, maxlen=self.max_points)
 
-    def _construct_ui(self):
-        central_widget = QWidget()
-        self.setCentralWidget(central_widget)
-        main_layout = QVBoxLayout(central_widget)
-        main_layout.setContentsMargins(30, 30, 30, 30)
-        main_layout.setSpacing(20)
+        self._build_sidebar()
+        self._build_main_content()
 
-        # --- ВЕРХНЯ ПАНЕЛЬ: Вибір пристрою ---
-        top_layout = QHBoxLayout()
-        self.combo_devices = QComboBox()
-        self.combo_devices.setStyleSheet("""
-            QComboBox {
-                border: 2px solid #8B5CF6;
-                border-radius: 8px;
-                padding: 5px 15px;
-                background: white;
-                font-size: 14px;
-            }
-        """)
-        top_layout.addWidget(self.combo_devices, stretch=1)
+        # Initial scan
+        self.scan_devices()
+        self.update_loop()
 
-        self.btn_toggle = QPushButton("Підключитись")
-        self.btn_toggle.setStyleSheet("""
-            QPushButton {
-                background-color: #8B5CF6; color: white;
-                border-radius: 8px; padding: 8px 20px; font-weight: bold;
-            }
-            QPushButton:hover { background-color: #7C3AED; }
-        """)
-        self.btn_toggle.clicked.connect(self._toggle_reading)
-        top_layout.addWidget(self.btn_toggle)
-        main_layout.addLayout(top_layout)
+    def _build_sidebar(self):
+        self.grid_columnconfigure(1, weight=1)
+        self.grid_rowconfigure(0, weight=1)
 
-        # --- СЕРЕДНЯ ПАНЕЛЬ: Графік (pyqtgraph) ---
-        self.graphWidget = pg.PlotWidget()
-        self.graphWidget.setBackground('w')
-        self.graphWidget.showGrid(x=True, y=True, alpha=0.3)
-        self.graphWidget.getAxis('left').setPen('grey')
-        self.graphWidget.getAxis('bottom').setPen('grey')
-        # Стилізація лінії графіка (синя, як на макеті)
-        pen = pg.mkPen(color=(59, 130, 246), width=2)
-        self.data_line = self.graphWidget.plot(self.plot_time, self.plot_freq, pen=pen)
-        main_layout.addWidget(self.graphWidget, stretch=1)
+        self.sidebar = ctk.CTkFrame(self, width=280, corner_radius=0)
+        self.sidebar.grid(row=0, column=0, sticky="nsew")
 
-        # --- НИЖНЯ ПАНЕЛЬ: Керування ---
-        bottom_layout = QHBoxLayout()
-        bottom_layout.setAlignment(Qt.AlignmentFlag.AlignLeft)
-        
-        # Блок "Час вимірювання"
-        time_meas_layout = QVBoxLayout()
-        lbl_time = QLabel("Час вимірювання")
-        lbl_time.setFont(QFont("Arial", 24, QFont.Weight.Bold))
-        time_meas_layout.addWidget(lbl_time)
+        ctk.CTkLabel(self.sidebar, text="HID CONTROL", font=ctk.CTkFont(size=24, weight="bold")).pack(pady=20)
 
-        btn_group_layout = QHBoxLayout()
-        self.btn_01s = QPushButton("0.1 s")
-        self.btn_1s = QPushButton("1 S")
-        self.btn_10s = QPushButton("10 S")
-        
-        # Загальний стиль для кнопок-пігулок
-        self.pill_style_inactive = """
-            QPushButton {
-                background-color: #EFE8FF; color: #5B21B6;
-                border-radius: 15px; padding: 8px 20px; font-weight: bold;
-            }
-        """
-        self.pill_style_active = """
-            QPushButton {
-                background-color: #6D6875; color: white;
-                border-radius: 15px; padding: 8px 20px; font-weight: bold;
-            }
-        """
-        for btn in [self.btn_01s, self.btn_1s, self.btn_10s]:
-            btn.setStyleSheet(self.pill_style_inactive)
-            btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            btn_group_layout.addWidget(btn)
+        # Device Selection
+        self.device_combo = ctk.CTkComboBox(self.sidebar, values=["No Devices Found"], width=220)
+        self.device_combo.pack(pady=10, padx=20)
 
-        # По замовчуванню активна перша
-        self.btn_01s.setStyleSheet(self.pill_style_active)
-        
-        # Прив'язка команд (замініть 'gate X' на реальні команди вашого МК)
-        self.btn_01s.clicked.connect(lambda: self._set_gate(self.btn_01s, "gate 0"))
-        self.btn_1s.clicked.connect(lambda: self._set_gate(self.btn_1s, "gate 1"))
-        self.btn_10s.clicked.connect(lambda: self._set_gate(self.btn_10s, "gate 2"))
-        
-        time_meas_layout.addLayout(btn_group_layout)
-        bottom_layout.addLayout(time_meas_layout)
-        
-        bottom_layout.addSpacing(50)
+        self.connect_btn = ctk.CTkButton(self.sidebar, text="Connect", command=self.on_connect_clicked)
+        self.connect_btn.pack(pady=5, padx=20)
 
-        # Блок "Тригер" та "Частота"
-        trigger_freq_layout = QVBoxLayout()
-        
-        # lbl_freq_title = QLabel("Частота")
-        # lbl_freq_title.setStyleSheet("color: #6B7280; font-size: 16px;")
-        # trigger_freq_layout.addWidget(lbl_freq_title)
+        self.refresh_btn = ctk.CTkButton(self.sidebar, text="Refresh List", fg_color="transparent",
+                                         border_width=1, command=self.scan_devices)
+        self.refresh_btn.pack(pady=5, padx=20)
 
-        action_row = QHBoxLayout()
-        
-        self.btn_trigger = QPushButton("Тригер")
-        self.btn_trigger.setStyleSheet("""
-            QPushButton {
-                background-color: #FFFFFF; color: #8B5CF6;
-                border: 2px solid #EFE8FF; border-radius: 20px;
-                padding: 10px 25px; font-weight: bold; font-size: 16px;
-            }
-            QPushButton:hover { background-color: #EFE8FF; }
-        """)
-        self.btn_trigger.clicked.connect(lambda: self._send_command("mode direct"))
-        action_row.addWidget(self.btn_trigger)
+        ctk.CTkFrame(self.sidebar, height=2, fg_color="gray30").pack(pady=20, fill="x", padx=20)
 
-        self.val_freq = QLineEdit("-- Гц")
-        self.val_freq.setReadOnly(True)
-        self.val_freq.setStyleSheet("""
-            QLineEdit {
-                background-color: white; border: 1px solid #D1D5DB;
-                border-radius: 8px; padding: 10px; font-size: 18px; color: #1F2937;
-            }
-        """)
-        self.val_freq.setFixedWidth(150)
-        action_row.addWidget(self.val_freq)
-        
-        trigger_freq_layout.addLayout(action_row)
-        bottom_layout.addLayout(trigger_freq_layout)
+        ctk.CTkButton(self.sidebar, text="Dashboard", command=self.show_dashboard).pack(pady=10, padx=20)
+        ctk.CTkButton(self.sidebar, text="Raw View", command=self.show_raw).pack(pady=10, padx=20)
 
-        main_layout.addLayout(bottom_layout)
 
-    def _set_gate(self, active_btn, command):
-        """Змінює стиль кнопок і надсилає команду вибору часу вимірювання."""
-        for btn in [self.btn_01s, self.btn_1s, self.btn_10s]:
-            btn.setStyleSheet(self.pill_style_inactive)
-        active_btn.setStyleSheet(self.pill_style_active)
-        self._send_command(command)
+        # --- Console Section ---
+        ctk.CTkFrame(self.sidebar, height=2, fg_color="gray30").pack(pady=20, fill="x", padx=20)
+        ctk.CTkLabel(self.sidebar, text="Command Console:", font=("Arial", 12)).pack(pady=(0, 5))
 
-    def _enumerate_hid_devices(self):
-        self.combo_devices.clear()
-        self.device_mapping.clear()
-        try:
-            for dev in hid.enumerate():
-                vid = dev.get("vendor_id", 0)
-                pid = dev.get("product_id", 0)
-                product = dev.get("product_string", "Unknown")
-                path = dev.get("path")
-                display_string = f"[{vid:04X}:{pid:04X}] - {product}"
-                if path:
-                    self.device_mapping[display_string] = path
-                    self.combo_devices.addItem(display_string)
-        except Exception as e:
-            print(f"Помилка пошуку пристроїв: {e}")
+        self.cmd_entry = ctk.CTkEntry(self.sidebar, placeholder_text="Type command...", width=200)
+        self.cmd_entry.pack(pady=5, padx=20, fill="x")
 
-    def _toggle_reading(self):
-        if self.reader_thread is None or not self.reader_thread.isRunning():
-            self._start_reading()
-        else:
-            self._stop_reading()
+        # Bind the 'Enter' key to send the command automatically
+        self.cmd_entry.bind("<Return>", lambda e: self.on_send_command())
 
-    def _start_reading(self):
-        selected_text = self.combo_devices.currentText()
-        if not selected_text or selected_text not in self.device_mapping:
+        self.send_btn = ctk.CTkButton(self.sidebar, text="Send", command=self.on_send_command, fg_color="gray20")
+        self.send_btn.pack(pady=5, padx=20, fill="x")
+
+        # Add a Recording Toggle Button to Sidebar
+        ctk.CTkFrame(self.sidebar, height=2, fg_color="gray30").pack(pady=20, fill="x", padx=20)
+        self.record_btn = ctk.CTkButton(
+            self.sidebar,
+            text="Start Recording",
+            fg_color="#28a745",
+            command=self.toggle_logging
+        )
+        self.record_btn.pack(pady=10, padx=20, fill="x")
+
+
+    def _build_main_content(self):
+        self.container = ctk.CTkFrame(self)
+        self.container.grid(row=0, column=1, padx=20, pady=20, sticky="nsew")
+        self.container.grid_columnconfigure(0, weight=1)
+        self.container.grid_rowconfigure(1, weight=1)
+
+        # Stats bar
+        self.stats_frame = ctk.CTkFrame(self.container, height=60)
+        self.stats_frame.grid(row=0, column=0, sticky="ew", padx=10, pady=10)
+
+        self.freq_label = ctk.CTkLabel(self.stats_frame, text="Freq: -- Hz", font=("Arial", 18, "bold"))
+        self.freq_label.pack(side="left", padx=20)
+
+        self.gate_label = ctk.CTkLabel(self.stats_frame, text="Gate: --", font=("Arial", 16))
+        self.gate_label.pack(side="left", padx=20)
+
+        self.status_label = ctk.CTkLabel(self.stats_frame, text="Disconnected", text_color="red")
+        self.status_label.pack(side="right", padx=20)
+
+        self._setup_plot()
+        self.raw_text = ctk.CTkTextbox(self.container, font=("Courier", 14))
+
+    def _setup_plot(self):
+        plt.style.use('dark_background')
+        self.fig, self.ax = plt.subplots(figsize=(5, 3), dpi=100)
+        self.fig.patch.set_facecolor('#2b2b2b')
+        self.ax.set_facecolor('#1a1a1a')
+        self.line, = self.ax.plot(range(self.max_points), list(self.y_data), color='#3a7ebf', linewidth=2)
+        self.ax.set_ylim(0, 1000)
+        self.canvas = FigureCanvasTkAgg(self.fig, master=self.container)
+        self.canvas.get_tk_widget().grid(row=1, column=0, sticky="nsew", padx=10, pady=10)
+
+    def scan_devices(self):
+        names = self.logic.scan()
+        if names:
+            self.device_combo.configure(values=names)
+            self.device_combo.set(names[0])
+        self.connect_btn.configure(text="Connect", state="normal", fg_color="#1f538d")
+
+    def on_connect_clicked(self):
+        # If already connected, the button acts as a Disconnect button
+        if self.logic.device is not None:
+            self.logic.disconnect()
+            self._reset_ui_to_disconnected()
+            self.raw_text.insert("end", ">>> Manual Disconnect <<<\n", "log_msg")
             return
 
-        device_path = self.device_mapping[selected_text]
-        self.reader_thread = HIDReaderThread(device_path)
-        self.reader_thread.sample_received.connect(self._update_live_sample)
-        self.reader_thread.start()
-
-        self.btn_toggle.setText("Відключитись")
-        self.combo_devices.setEnabled(False)
-        self._send_command("stream on")
-
-    def _stop_reading(self):
-        if self.reader_thread and self.reader_thread.isRunning():
-            self.reader_thread.stop_reading()
-            self.reader_thread = None
-
-        self.btn_toggle.setText("Підключитись")
-        self.combo_devices.setEnabled(True)
-
-    def _send_command(self, command: str):
-        if self.reader_thread and self.reader_thread.isRunning():
-            self.reader_thread.enqueue_command(command)
-
-    def _update_live_sample(self, sample: dict):
-        """Оновлює поле частоти та малює графік."""
-        freq_hz = sample.get("freq_hz", 0)
-        
-        # Оновлення тексту
-        if freq_hz >= 1000000:
-            self.val_freq.setText(f"{freq_hz / 1000000:.3f} МГц")
+        # Otherwise, attempt to connect
+        selection = self.device_combo.get()
+        if self.logic.connect(selection):
+            self.status_label.configure(text="Connected", text_color="green")
+            self.connect_btn.configure(text="Disconnect", fg_color="#dc3545", hover_color="#c82333")
+            self.raw_text.insert("end", f">>> Connected to {selection} <<<\n")
         else:
-            self.val_freq.setText(f"{freq_hz} Гц")
+            messagebox.showerror("Error", "Could not connect to device.")
 
-        # Оновлення графіка
-        self.time_counter += 1
-        self.plot_time.append(self.time_counter)
-        self.plot_freq.append(freq_hz)
+    def _reset_ui_to_disconnected(self):
+        """Helper to reset UI elements to their default state."""
+        self.status_label.configure(text="Disconnected", text_color="red")
+        self.connect_btn.configure(text="Connect", state="normal", fg_color="#1f538d")
+        self.freq_label.configure(text="Freq: -- Hz")
+        self.gate_label.configure(text="Gate: --")
 
-        # Зберігаємо лише останні 100 точок, щоб графік не переповнювався
-        if len(self.plot_time) > 100:
-            self.plot_time.pop(0)
-            self.plot_freq.pop(0)
+    def show_dashboard(self):
+        self.raw_text.grid_forget()
+        self.canvas.get_tk_widget().grid(row=1, column=0, sticky="nsew", padx=10, pady=10)
 
-        self.data_line.setData(self.plot_time, self.plot_freq)
+    def show_raw(self):
+        self.canvas.get_tk_widget().grid_forget()
+        self.raw_text.grid(row=1, column=0, sticky="nsew", padx=10, pady=10)
 
-    def closeEvent(self, event):
-        if self.reader_thread and self.reader_thread.isRunning():
-            self.reader_thread.stop_reading()
-        event.accept()
+    def on_send_command(self):
+        cmd = self.cmd_entry.get()
+        if not cmd:
+            return
+
+        if self.logic.send_command(cmd):
+            self.raw_text.insert("end", f"TX -> {cmd}\n", "out_msg")
+            self.raw_text.tag_config("out_msg", foreground="#3a7ebf")  # Color code outgoing msgs
+            self.raw_text.see("end")
+            self.cmd_entry.delete(0, 'end')  # Clear input
+        else:
+            messagebox.showwarning("Console", "Failed to send. Is the device connected?")
+
+
+    def toggle_logging(self):
+        """Toggles CSV recording on/off."""
+        if not self.logic.is_logging:
+            fname = self.logic.logger.start()
+            self.logic.is_logging = True
+            self.record_btn.configure(text="Stop Recording", fg_color="#dc3545")
+            self.raw_text.insert("end", f">>> CSV Logging Started: {fname}\n", "log_msg")
+        else:
+            self.logic.logger.stop()
+            self.logic.is_logging = False
+            self.record_btn.configure(text="Start Recording", fg_color="#28a745")
+            self.raw_text.insert("end", f">>> CSV Logging Stopped.\n", "log_msg")
+        self.raw_text.tag_config("log_msg", foreground="orange")
+
+
+    def update_loop(self):
+        try:
+            sample = self.logic.read_sample()
+
+            if sample:
+                self.freq_label.configure(text=f"Freq: {sample.freq_hz} Hz")
+                self.gate_label.configure(text=f"Gate: {sample.gate_label()}")
+
+                if self.logic.is_logging:
+                    self.logic.logger.log(sample)
+
+                # Plotting
+                self.y_data.append(sample.freq_hz)
+                self.line.set_ydata(list(self.y_data))
+                curr_max = max(self.y_data)
+                limit = max(10, curr_max * 1.15)
+                _, ex_max = self.ax.get_ylim()
+                if curr_max > ex_max or curr_max < (ex_max * 0.5):
+                    self.ax.set_ylim(0, limit)
+                self.canvas.draw_idle()
+
+                # UI Log
+                ui_time = datetime.now().strftime("%H:%M:%S")
+                self.raw_text.insert("end", f"[{ui_time}] {sample}\n")
+                self.raw_text.see("end")
+                if float(self.raw_text.index('end-1c')) > 100:
+                    self.raw_text.delete("1.0", "2.0")
+
+            elif self.logic.device is None and self.status_label.cget("text") == "Connected":
+                self._reset_ui_to_disconnected()
+                self.raw_text.insert("end", ">>> Connection Lost <<<\n", "log_msg")
+
+        except Exception as ui_err:
+            self.logic.err_log.log_error(f"UI Loop Error: {ui_err}")
+
+        self.after(30, self.update_loop)
+
 
 if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    window = ModernHackathonGUI()
-    window.show()
-    sys.exit(app.exec())
+    app = HidApp()
+    app.mainloop()
