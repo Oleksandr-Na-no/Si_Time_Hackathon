@@ -1,2 +1,5 @@
 [2026-04-15 20:49:10] ERROR: Read error: Success
 [2026-04-15 20:49:24] ERROR: Send command 'dd' failed: argument 2: TypeError: 'list' object cannot be interpreted as ctypes.c_char_p
+[2026-04-15 20:53:07] ERROR: Read error: Success
+[2026-04-15 20:53:11] ERROR: Connection to STM32 Frequency Counter (0xc0de:0xcafe) [/dev/hidraw7] failed: unable to open device: Failed to open a device with path '/dev/hidraw7': No such file or directory
+[2026-04-15 20:53:14] ERROR: Connection to STM32 Frequency Counter (0xc0de:0xcafe) [/dev/hidraw7] failed: unable to open device: Failed to open a device with path '/dev/hidraw7': No such file or directory
