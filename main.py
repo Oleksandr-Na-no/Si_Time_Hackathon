@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from collections import deque
 from tkinter import messagebox
-
+from datetime import datetime
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
@@ -54,6 +54,21 @@ class HidApp(ctk.CTk):
         ctk.CTkButton(self.sidebar, text="Dashboard", command=self.show_dashboard).pack(pady=10, padx=20)
         ctk.CTkButton(self.sidebar, text="Raw View", command=self.show_raw).pack(pady=10, padx=20)
 
+
+        # --- Console Section ---
+        ctk.CTkFrame(self.sidebar, height=2, fg_color="gray30").pack(pady=20, fill="x", padx=20)
+        ctk.CTkLabel(self.sidebar, text="Command Console:", font=("Arial", 12)).pack(pady=(0, 5))
+
+        self.cmd_entry = ctk.CTkEntry(self.sidebar, placeholder_text="Type command...", width=200)
+        self.cmd_entry.pack(pady=5, padx=20, fill="x")
+
+        # Bind the 'Enter' key to send the command automatically
+        self.cmd_entry.bind("<Return>", lambda e: self.on_send_command())
+
+        self.send_btn = ctk.CTkButton(self.sidebar, text="Send", command=self.on_send_command, fg_color="gray20")
+        self.send_btn.pack(pady=5, padx=20, fill="x")
+
+
     def _build_main_content(self):
         self.container = ctk.CTkFrame(self)
         self.container.grid(row=0, column=1, padx=20, pady=20, sticky="nsew")
@@ -94,12 +109,28 @@ class HidApp(ctk.CTk):
         self.connect_btn.configure(text="Connect", state="normal", fg_color="#1f538d")
 
     def on_connect_clicked(self):
+        # If already connected, the button acts as a Disconnect button
+        if self.logic.device is not None:
+            self.logic.disconnect()
+            self._reset_ui_to_disconnected()
+            self.raw_text.insert("end", ">>> Manual Disconnect <<<\n", "log_msg")
+            return
+
+        # Otherwise, attempt to connect
         selection = self.device_combo.get()
         if self.logic.connect(selection):
             self.status_label.configure(text="Connected", text_color="green")
-            self.connect_btn.configure(text="Connected", state="disabled", fg_color="green")
+            self.connect_btn.configure(text="Disconnect", fg_color="#dc3545", hover_color="#c82333")
+            self.raw_text.insert("end", f">>> Connected to {selection} <<<\n")
         else:
             messagebox.showerror("Error", "Could not connect to device.")
+
+    def _reset_ui_to_disconnected(self):
+        """Helper to reset UI elements to their default state."""
+        self.status_label.configure(text="Disconnected", text_color="red")
+        self.connect_btn.configure(text="Connect", state="normal", fg_color="#1f538d")
+        self.freq_label.configure(text="Freq: -- Hz")
+        self.gate_label.configure(text="Gate: --")
 
     def show_dashboard(self):
         self.raw_text.grid_forget()
@@ -109,17 +140,37 @@ class HidApp(ctk.CTk):
         self.canvas.get_tk_widget().grid_forget()
         self.raw_text.grid(row=1, column=0, sticky="nsew", padx=10, pady=10)
 
+    def on_send_command(self):
+        cmd = self.cmd_entry.get()
+        if not cmd:
+            return
+
+        if self.logic.send_command(cmd):
+            self.raw_text.insert("end", f"TX -> {cmd}\n", "out_msg")
+            self.raw_text.tag_config("out_msg", foreground="#3a7ebf")  # Color code outgoing msgs
+            self.raw_text.see("end")
+            self.cmd_entry.delete(0, 'end')  # Clear input
+        else:
+            messagebox.showwarning("Console", "Failed to send. Is the device connected?")
+
     def update_loop(self):
         sample = self.logic.read_sample()
-        if sample:
-            self.freq_label.configure(text=f"Freq: {sample.freq_hz} Hz")
-            self.gate_label.configure(text=f"Gate: {sample.gate_label()}")
 
-            # Update Plot
+        # Check if we got a valid packet (usually 10 bytes)
+        if sample:
+            # 1. Update UI Elements
+            self.freq_label.configure(text=f"Freq: {sample.freq_hz} Hz")
+            self.gate_label.configure(text=f"Gate: {sample.gate_label()}")  # Fix for bound method error
+          #  self.logic.logger.start()
+            # 2. Log to CSV with Date/Time if active
+            if self.logic.is_logging:
+                self.logic.logger.log(sample)
+
+            # 3. Update the Plot
             self.y_data.append(sample.freq_hz)
             self.line.set_ydata(list(self.y_data))
 
-            # Autoscaling
+            # Dynamic scaling logic
             curr_max = max(self.y_data)
             limit = max(10, curr_max * 1.15)
             _, ex_max = self.ax.get_ylim()
@@ -127,15 +178,14 @@ class HidApp(ctk.CTk):
                 self.ax.set_ylim(0, limit)
             self.canvas.draw_idle()
 
-            # Raw Log
-            self.raw_text.insert("end", f"{sample}\n")
+            # 4. Raw Log with timestamp for the UI
+            ui_time = datetime.now().strftime("%H:%M:%S")
+            self.raw_text.insert("end", f"[{ui_time}] {sample}\n")
             self.raw_text.see("end")
-            if float(self.raw_text.index('end-1c')) > 50:
-                self.raw_text.delete("1.0", "2.0")
 
         elif self.logic.device is None and self.status_label.cget("text") == "Connected":
-            self.status_label.configure(text="Disconnected", text_color="red")
-            self.connect_btn.configure(text="Connect", state="normal", fg_color="#1f538d")
+            self._reset_ui_to_disconnected()
+            self.raw_text.insert("end", ">>> Connection Lost <<<\n", "log_msg")
 
         self.after(30, self.update_loop)
 

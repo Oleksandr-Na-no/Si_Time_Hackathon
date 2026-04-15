@@ -1,11 +1,15 @@
 import hid
-from hid_sample import HidSample
 
+from csv_logger import CsvLogger
+from hid_sample import HidSample
+from datetime import datetime
 
 class HidController:
     def __init__(self):
         self.device = None
         self.available_devices = {}
+        self.logger = CsvLogger()
+        self.is_logging = False
 
     def scan(self):
         """Returns a list of display names for the UI."""
@@ -55,3 +59,24 @@ class HidController:
         if self.device:
             self.device.close()
             self.device = None
+
+    def send_command(self, command_str):
+        """Sends a string command to the HID device."""
+        if not self.device:
+            return False
+
+        try:
+            # Convert string to bytes
+            data = command_str.encode('utf-8')
+
+            # HID reports usually need to be a fixed size (e.g., 64 bytes)
+            # Most STM32 custom HID examples use 64. Adjust if yours is different.
+            report = list(data)
+            report = report[:64] + [0] * (64 - len(report))
+
+            # Send the data (HID requires the first byte to be the Report ID, usually 0)
+            self.device.write([0] + report)
+            return True
+        except Exception as e:
+            print(f"Write error: {e}")
+            return False

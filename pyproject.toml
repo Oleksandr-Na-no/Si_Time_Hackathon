@@ -5,6 +5,7 @@ description = "Add your description here"
 requires-python = ">=3.14"
 dependencies = [
     "customtkinter>=5.2.2",
+    "datetime>=6.0",
     "hid>=1.0.9",
     "matplotlib>=3.10.8",
     "pyqt6>=6.11.0",
