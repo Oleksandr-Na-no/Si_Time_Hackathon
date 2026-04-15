@@ -68,6 +68,16 @@ class HidApp(ctk.CTk):
         self.send_btn = ctk.CTkButton(self.sidebar, text="Send", command=self.on_send_command, fg_color="gray20")
         self.send_btn.pack(pady=5, padx=20, fill="x")
 
+        # Add a Recording Toggle Button to Sidebar
+        ctk.CTkFrame(self.sidebar, height=2, fg_color="gray30").pack(pady=20, fill="x", padx=20)
+        self.record_btn = ctk.CTkButton(
+            self.sidebar,
+            text="Start Recording",
+            fg_color="#28a745",
+            command=self.toggle_logging
+        )
+        self.record_btn.pack(pady=10, padx=20, fill="x")
+
 
     def _build_main_content(self):
         self.container = ctk.CTkFrame(self)
@@ -153,39 +163,56 @@ class HidApp(ctk.CTk):
         else:
             messagebox.showwarning("Console", "Failed to send. Is the device connected?")
 
+
+    def toggle_logging(self):
+        """Toggles CSV recording on/off."""
+        if not self.logic.is_logging:
+            fname = self.logic.logger.start()
+            self.logic.is_logging = True
+            self.record_btn.configure(text="Stop Recording", fg_color="#dc3545")
+            self.raw_text.insert("end", f">>> CSV Logging Started: {fname}\n", "log_msg")
+        else:
+            self.logic.logger.stop()
+            self.logic.is_logging = False
+            self.record_btn.configure(text="Start Recording", fg_color="#28a745")
+            self.raw_text.insert("end", f">>> CSV Logging Stopped.\n", "log_msg")
+        self.raw_text.tag_config("log_msg", foreground="orange")
+
+
     def update_loop(self):
-        sample = self.logic.read_sample()
+        try:
+            sample = self.logic.read_sample()
 
-        # Check if we got a valid packet (usually 10 bytes)
-        if sample:
-            # 1. Update UI Elements
-            self.freq_label.configure(text=f"Freq: {sample.freq_hz} Hz")
-            self.gate_label.configure(text=f"Gate: {sample.gate_label()}")  # Fix for bound method error
-          #  self.logic.logger.start()
-            # 2. Log to CSV with Date/Time if active
-            if self.logic.is_logging:
-                self.logic.logger.log(sample)
+            if sample:
+                self.freq_label.configure(text=f"Freq: {sample.freq_hz} Hz")
+                self.gate_label.configure(text=f"Gate: {sample.gate_label()}")
 
-            # 3. Update the Plot
-            self.y_data.append(sample.freq_hz)
-            self.line.set_ydata(list(self.y_data))
+                if self.logic.is_logging:
+                    self.logic.logger.log(sample)
 
-            # Dynamic scaling logic
-            curr_max = max(self.y_data)
-            limit = max(10, curr_max * 1.15)
-            _, ex_max = self.ax.get_ylim()
-            if curr_max > ex_max or curr_max < (ex_max * 0.5):
-                self.ax.set_ylim(0, limit)
-            self.canvas.draw_idle()
+                # Plotting
+                self.y_data.append(sample.freq_hz)
+                self.line.set_ydata(list(self.y_data))
+                curr_max = max(self.y_data)
+                limit = max(10, curr_max * 1.15)
+                _, ex_max = self.ax.get_ylim()
+                if curr_max > ex_max or curr_max < (ex_max * 0.5):
+                    self.ax.set_ylim(0, limit)
+                self.canvas.draw_idle()
 
-            # 4. Raw Log with timestamp for the UI
-            ui_time = datetime.now().strftime("%H:%M:%S")
-            self.raw_text.insert("end", f"[{ui_time}] {sample}\n")
-            self.raw_text.see("end")
+                # UI Log
+                ui_time = datetime.now().strftime("%H:%M:%S")
+                self.raw_text.insert("end", f"[{ui_time}] {sample}\n")
+                self.raw_text.see("end")
+                if float(self.raw_text.index('end-1c')) > 100:
+                    self.raw_text.delete("1.0", "2.0")
 
-        elif self.logic.device is None and self.status_label.cget("text") == "Connected":
-            self._reset_ui_to_disconnected()
-            self.raw_text.insert("end", ">>> Connection Lost <<<\n", "log_msg")
+            elif self.logic.device is None and self.status_label.cget("text") == "Connected":
+                self._reset_ui_to_disconnected()
+                self.raw_text.insert("end", ">>> Connection Lost <<<\n", "log_msg")
+
+        except Exception as ui_err:
+            self.logic.err_log.log_error(f"UI Loop Error: {ui_err}")
 
         self.after(30, self.update_loop)
 

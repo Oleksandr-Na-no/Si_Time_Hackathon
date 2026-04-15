@@ -1,0 +1,2 @@
+[2026-04-15 20:49:10] ERROR: Read error: Success
+[2026-04-15 20:49:24] ERROR: Send command 'dd' failed: argument 2: TypeError: 'list' object cannot be interpreted as ctypes.c_char_p
